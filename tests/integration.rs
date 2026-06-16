@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::prelude::*;
 use common::{make_content, sha256, ServerBehavior, TestServer};
 use fast_downloader::{
-    CancellationToken, DownloadEvent, DownloadQueue, DownloadTask, Downloader, DownloaderConfig,
-    NoopReporter, ProgressReporter,
+    CancellationToken, Checksum, DownloadEvent, DownloadQueue, DownloadTask, Downloader,
+    DownloaderConfig, NoopReporter, ProgressReporter,
 };
 
 /// Capture all events emitted during a test so we can assert on them later.
@@ -429,6 +430,346 @@ async fn etag_unaware_resume_invalidates_when_size_changes() {
 }
 
 #[tokio::test]
+async fn etag_change_invalidates_resume_same_size() {
+    // The corruption case ETag validation closes: a prior run left partial bytes
+    // of one version on disk, then the server's content changed to a *different
+    // file of the same size* with a new ETag. A size-only resume check would
+    // splice the old partial bytes with new ones (corruption); with ETag
+    // validation the stale state must be discarded and the new content fetched.
+    //
+    // The prior-run state is constructed deterministically (a half-written file
+    // plus a matching `.dlstate`) so the test exercises the resume *decision*
+    // directly, with no dependence on interrupt timing or how a server's
+    // mid-stream drop is surfaced.
+    let size = 512 * 1024usize;
+    let half = size / 2;
+    let content_v1 = make_content(size, 21);
+    let content_v2 = make_content(size, 22);
+    let want_v2 = sha256(&content_v2);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("etag.bin");
+
+    // Half-written file: v1's first half on disk, the rest still zero-filled.
+    let mut partial = content_v1[..half].to_vec();
+    partial.resize(size, 0);
+    std::fs::write(&dest, &partial).unwrap();
+
+    // A resume state tagged with the OLD validator, recording that single
+    // [0, size) worker is half-done. (Hand-written to match the on-disk format.)
+    let mut state_path = dest.clone().into_os_string();
+    state_path.push(".dlstate");
+    let state_path = PathBuf::from(state_path);
+    let state_json = format!(
+        r#"{{"version":2,"url":"http://old/etag.bin","file_size":{size},"etag":"\"v1\"","last_modified":null,"workers":[{{"start":0,"current":{half},"end":{size}}}]}}"#
+    );
+    std::fs::write(&state_path, state_json).unwrap();
+
+    // Server now serves different bytes of the same size, with a new ETag.
+    let server = TestServer::start(
+        content_v2.clone(),
+        ServerBehavior {
+            support_range: true,
+            etag: Some("\"v2\"".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    // threads > 1 so we take the multi-thread path that consults the state file.
+    let task = DownloadTask::new(server.url("/etag.bin"), dest.clone()).with_threads(4);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, size as u64);
+    assert_eq!(
+        sha256(&std::fs::read(&dest).unwrap()),
+        want_v2,
+        "a changed ETag must not be resumed into — the file would be corrupt"
+    );
+}
+
+#[tokio::test]
+async fn matching_etag_still_resumes() {
+    // The flip side: when the ETag is unchanged, resume must still work so the
+    // safety check doesn't cost us efficiency on the happy path.
+    let content = make_content(512 * 1024, 99);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content.clone(),
+        ServerBehavior {
+            support_range: true,
+            drop_first_n_responses: 4, // force at least one resume
+            chunk_size: 8 * 1024,
+            etag: Some("\"stable\"".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("stable.bin");
+    let task = DownloadTask::new(server.url("/stable.bin"), dest.clone()).with_threads(8);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, content.len() as u64);
+    assert_eq!(sha256(&std::fs::read(&dest).unwrap()), want);
+    assert!(server.stats.dropped_responses.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
+async fn if_range_detects_change_multithread() {
+    // The server reports the resource changed since it was probed (it answers
+    // any If-Range request with a full 200). A multi-thread worker must surface
+    // this as ResourceChanged — failing safe — instead of splicing versions.
+    let content = make_content(512 * 1024, 5);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            etag: Some("\"v1\"".into()),
+            if_range_stale: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("changed.bin");
+    let task = DownloadTask::new(server.url("/changed.bin"), dest.clone()).with_threads(4);
+    let err = dl
+        .download(task, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_resource_changed(),
+        "expected ResourceChanged, got {err}"
+    );
+
+    // The now-worthless state must be cleared so a rerun starts fresh.
+    let mut state_path = dest.into_os_string();
+    state_path.push(".dlstate");
+    assert!(
+        !PathBuf::from(state_path).exists(),
+        "stale state not cleared"
+    );
+}
+
+#[tokio::test]
+async fn if_range_single_thread_restarts_on_change() {
+    // A half-written file from an old version exists; the server then reports a
+    // change on the If-Range resume request. The single-thread path must
+    // truncate and re-fetch rather than append new bytes onto stale ones.
+    let size = 256 * 1024usize;
+    let content_v1 = make_content(size, 1);
+    let content_v2 = make_content(size, 2);
+    let want_v2 = sha256(&content_v2);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("s.bin");
+    std::fs::write(&dest, &content_v1[..size / 2]).unwrap(); // stale partial
+
+    let server = TestServer::start(
+        content_v2.clone(),
+        ServerBehavior {
+            support_range: true,
+            etag: Some("\"v2\"".into()),
+            if_range_stale: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    // threads = 1 forces the single-thread path.
+    let task = DownloadTask::new(server.url("/s.bin"), dest.clone()).with_threads(1);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, size as u64);
+    assert_eq!(
+        sha256(&std::fs::read(&dest).unwrap()),
+        want_v2,
+        "single-thread resume must heal a changed resource, not corrupt it"
+    );
+}
+
+#[tokio::test]
+async fn caller_checksum_accepts_correct_file() {
+    let content = make_content(512 * 1024, 3);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("ck.bin");
+    let task = DownloadTask::new(server.url("/ck.bin"), dest.clone())
+        .with_threads(8)
+        .with_checksum(Checksum::Sha256(want));
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, 512 * 1024);
+    assert!(dest.exists());
+}
+
+#[tokio::test]
+async fn caller_checksum_rejects_and_removes_bad_file() {
+    let content = make_content(512 * 1024, 3);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("ck.bin");
+    // Wrong expected hash -> verification must fail and remove the file.
+    let task = DownloadTask::new(server.url("/ck.bin"), dest.clone())
+        .with_threads(8)
+        .with_checksum(Checksum::Sha256([0u8; 32]));
+    let err = dl
+        .download(task, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.is_checksum_mismatch(), "got {err}");
+    assert!(
+        !dest.exists(),
+        "a file that fails verification must be removed"
+    );
+}
+
+#[tokio::test]
+async fn server_repr_digest_is_verified() {
+    let content = make_content(300 * 1024, 8);
+    let good = format!("sha-256=:{}:", BASE64_STANDARD.encode(sha256(&content)));
+
+    // Correct server digest, no caller checksum -> auto-verified, succeeds.
+    let server = TestServer::start(
+        content.clone(),
+        ServerBehavior {
+            support_range: true,
+            repr_digest: Some(good),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("d.bin");
+    let task = DownloadTask::new(server.url("/d.bin"), dest.clone()).with_threads(8);
+    dl.download(task, CancellationToken::new()).await.unwrap();
+    assert!(dest.exists());
+
+    // Wrong server digest -> auto-verification fails and removes the file.
+    let bad = format!("sha-256=:{}:", BASE64_STANDARD.encode([0u8; 32]));
+    let server2 = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            repr_digest: Some(bad),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dest2 = tmp.path().join("d2.bin");
+    let task = DownloadTask::new(server2.url("/d2.bin"), dest2.clone()).with_threads(8);
+    let err = dl
+        .download(task, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.is_checksum_mismatch(), "got {err}");
+    assert!(!dest2.exists());
+}
+
+#[tokio::test]
+async fn server_digest_verification_can_be_disabled() {
+    let content = make_content(128 * 1024, 9);
+    let bad = format!("sha-256=:{}:", BASE64_STANDARD.encode([0u8; 32]));
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            repr_digest: Some(bad), // would fail if honored
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.verify_server_digest = false;
+    let dl = Downloader::with_config(cfg, Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("nd.bin");
+    let task = DownloadTask::new(server.url("/nd.bin"), dest.clone()).with_threads(8);
+    // With server-digest verification off, the bogus digest is ignored.
+    dl.download(task, CancellationToken::new()).await.unwrap();
+    assert!(dest.exists());
+}
+
+#[tokio::test]
+async fn durable_resume_multithread_recovers() {
+    // `durable_resume` fdatasyncs the data file before each checkpoint. We can't
+    // crash-test power loss here, but this drives that path under a real resume
+    // and confirms it still yields the correct file (i.e. the extra syncs and
+    // the second data-file handle don't break the download).
+    let content = make_content(512 * 1024, 99);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            drop_first_n_responses: 4,
+            chunk_size: 8 * 1024,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.durable_resume = true;
+    let dl = Downloader::with_config(cfg, Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dur.bin");
+    let task = DownloadTask::new(server.url("/dur.bin"), dest.clone()).with_threads(8);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, 512 * 1024);
+    assert_eq!(sha256(&std::fs::read(&dest).unwrap()), want);
+}
+
+#[tokio::test]
+async fn durable_resume_single_thread_ok() {
+    let content = make_content(96 * 1024, 7);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.durable_resume = true;
+    cfg.flush_interval_bytes = 16 * 1024; // force several fsyncs across the file
+    let dl = Downloader::with_config(cfg, Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("durs.bin");
+    let task = DownloadTask::new(server.url("/durs.bin"), dest.clone()).with_threads(1);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, 96 * 1024);
+    assert_eq!(sha256(&std::fs::read(&dest).unwrap()), want);
+}
+
+#[tokio::test]
 async fn empty_file_downloads_cleanly() {
     let server = TestServer::start(
         Vec::new(),
@@ -504,6 +845,64 @@ async fn many_concurrent_queue_downloads_under_multi_thread() {
     }
     assert_eq!(ok, n);
     queue.shutdown().await;
+}
+
+/// Throughput benchmark. The server runs on its **own** runtime in a dedicated
+/// OS thread so it never steals the client's runtime threads — the timing then
+/// reflects the client's download path, not in-process server contention. Run:
+///   cargo test --release --test integration -- --ignored --nocapture bench
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+async fn bench_multi_thread_throughput() {
+    let size = 128 * 1024 * 1024; // 128 MiB
+    let content = make_content(size, 7);
+
+    // Spin the test server up on an isolated 2-thread runtime in its own OS
+    // thread. We only need its address back; the thread parks forever.
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let server = TestServer::start(
+                content,
+                ServerBehavior {
+                    support_range: true,
+                    chunk_size: 16 * 1024, // many small chunks: stress the path
+                    ..Default::default()
+                },
+            )
+            .await;
+            addr_tx.send(server.addr).unwrap();
+            std::future::pending::<()>().await; // keep server alive
+        });
+    });
+    let addr = addr_rx.recv().unwrap();
+
+    let dl = Downloader::with_config(DownloaderConfig::default(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let runs = 5;
+    let mut best = f64::MAX;
+    for i in 0..runs {
+        let dest = tmp.path().join(format!("bench{i}.bin"));
+        let url = format!("http://{addr}/bench{i}.bin");
+        let task = DownloadTask::new(url, dest).with_threads(16);
+        let t = std::time::Instant::now();
+        let out = dl.download(task, CancellationToken::new()).await.unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        let mibps = (out.size as f64 / (1024.0 * 1024.0)) / secs;
+        best = best.min(secs);
+        eprintln!("run {i}: {secs:.3}s  {mibps:.1} MiB/s");
+    }
+    eprintln!(
+        "best: {best:.3}s  ({:.1} MiB/s) over {} MiB",
+        (size as f64 / (1024.0 * 1024.0)) / best,
+        size / (1024 * 1024)
+    );
 }
 
 #[tokio::test]

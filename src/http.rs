@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use reqwest::{Client, StatusCode, Url};
 
+use crate::checksum::{self, Checksum};
 use crate::error::{Error, Result};
 use crate::filename;
 
@@ -45,6 +46,10 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client> {
         .user_agent(&cfg.user_agent)
         .connect_timeout(cfg.connect_timeout)
         .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
+        // reqwest already defaults this on; set it explicitly so a future
+        // default change can't silently let Nagle delay our small range
+        // requests behind unacked bulk data.
+        .tcp_nodelay(true)
         // We do not set a global `timeout()` because that would also kill
         // long-running streamed chunk transfers. Per-request timeouts are
         // attached individually.
@@ -66,7 +71,28 @@ pub struct FileInfo {
     /// chunked transfer encoding, or omitted Content-Length).
     pub size: Option<u64>,
     pub supports_range: bool,
+    /// Strong/weak validator for the resource. Used to refuse resuming into a
+    /// resource that changed under us (which would corrupt the file).
     pub etag: Option<String>,
+    /// Secondary validator, checked when no `ETag` is available on both sides.
+    pub last_modified: Option<String>,
+    /// Strongest content digest the server advertised for the full
+    /// representation (from `Repr-Digest` / `Digest` / `Content-MD5`), if any.
+    /// Used for end-to-end verification when the caller supplies no checksum.
+    pub digest: Option<Checksum>,
+}
+
+impl FileInfo {
+    /// Validator to send in `If-Range` so the server only honours a Range
+    /// request while the resource is unchanged. RFC 9110 forbids a *weak* ETag
+    /// here (it doesn't imply byte-for-byte identity), so we fall back to
+    /// `Last-Modified` in that case.
+    pub fn if_range_validator(&self) -> Option<&str> {
+        match self.etag.as_deref() {
+            Some(e) if !e.starts_with("W/") => Some(e),
+            _ => self.last_modified.as_deref(),
+        }
+    }
 }
 
 /// Probe a URL using HEAD and, when necessary, a tiny Range GET, to discover
@@ -100,6 +126,10 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
     let mut size: Option<u64> = None;
     let mut supports_range: Option<bool> = None;
     let mut etag: Option<String> = None;
+    let mut last_modified: Option<String> = None;
+    // Captured only from HEAD (or a full 200): a digest from a 206 range probe
+    // could describe just the probed byte, not the whole representation.
+    let mut digest: Option<Checksum> = None;
 
     if let Ok(resp) = head {
         if resp.status().is_success() {
@@ -116,6 +146,17 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
                 .get(reqwest::header::ETAG)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            last_modified = resp
+                .headers()
+                .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let h = resp.headers();
+            digest = checksum::digest_from_parts(
+                h.get("repr-digest").and_then(|v| v.to_str().ok()),
+                h.get("digest").and_then(|v| v.to_str().ok()),
+                h.get("content-md5").and_then(|v| v.to_str().ok()),
+            );
             let ar = resp
                 .headers()
                 .get(reqwest::header::ACCEPT_RANGES)
@@ -134,6 +175,8 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
                     size,
                     supports_range: true,
                     etag,
+                    last_modified,
+                    digest,
                 });
             }
         }
@@ -159,6 +202,13 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
         etag = resp
             .headers()
             .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+    }
+    if last_modified.is_none() {
+        last_modified = resp
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
     }
@@ -195,6 +245,8 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
         size,
         supports_range: confirmed_range || supports_range == Some(true),
         etag,
+        last_modified,
+        digest,
     })
 }
 

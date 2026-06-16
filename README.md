@@ -9,6 +9,27 @@ speed reporting.
 - **16 worker threads by default** per task, configurable per-task and globally.
 - **Resumable**: state is persisted to `<file>.dlstate` and atomically rewritten
   on a ticker; interrupted downloads continue where they left off.
+- **Validated resume**: the resume state records the resource's `ETag` /
+  `Last-Modified`, and every range request carries `If-Range`. A server that
+  has changed the resource then answers `200` instead of `206`, so a same-size
+  change can never splice two versions together — the multi-thread path fails
+  cleanly (and clears the stale state) while the single-thread path truncates
+  and re-fetches. Unchanged (or validator-less) resources resume exactly as
+  before, at no extra cost.
+- **End-to-end checksum verification** (opt-in): pass an expected digest via
+  `DownloadTask::with_checksum(...)`, or let the downloader auto-verify against a
+  server `Repr-Digest` / `Digest` / `Content-MD5`. On completion the file is
+  hashed and a mismatch fails the download and removes the file. This is the only
+  check that also catches a power-loss resume gap or on-disk bit-rot. Runs only
+  when a digest is available, so it costs nothing otherwise (toggle the
+  server-digest path with `DownloaderConfig::verify_server_digest`).
+- **Power-loss-durable resume** (opt-in, `DownloaderConfig::durable_resume`):
+  the data file is `fsync`ed before each resume checkpoint, so saved progress
+  never names bytes the OS hasn't durably written — closing the one window a
+  validator/checksum can't (a checksum-less download interrupted by power loss).
+  Off by default: the default already survives a process kill (the page cache
+  outlives the process); only a hard power loss needs the extra `fsync`s, which
+  cost throughput.
 - **Single-thread fallback** when the server does not support Range, with
   Range-based resume for that path too.
 - **No shared file mutex**: each worker holds its own file descriptor and

@@ -18,8 +18,17 @@ pub enum Error {
     #[error("server does not support range requests")]
     NoRangeSupport,
 
+    #[error("remote resource changed during download (If-Range validator no longer matches)")]
+    ResourceChanged,
+
     #[error("byte total mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
+
+    #[error("checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+
+    #[error("invalid checksum: {0}")]
+    InvalidChecksum(String),
 
     #[error("download cancelled")]
     Cancelled,
@@ -48,5 +57,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl Error {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Error::Cancelled)
+    }
+
+    /// True if the download stopped because the remote resource changed under
+    /// us (detected via `If-Range`). The partial bytes are for the old version;
+    /// a fresh download is required (re-running does this automatically).
+    pub fn is_resource_changed(&self) -> bool {
+        matches!(self, Error::ResourceChanged)
+    }
+
+    /// True if the completed file failed content verification. The corrupt file
+    /// is removed, so re-running performs a clean fresh download.
+    pub fn is_checksum_mismatch(&self) -> bool {
+        matches!(self, Error::ChecksumMismatch { .. })
     }
 }

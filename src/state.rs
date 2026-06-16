@@ -10,7 +10,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::{Error, Result};
 
-pub const STATE_FILE_VERSION: u32 = 1;
+// v2 adds the resource validators (`etag` / `last_modified`) so a resume can
+// refuse to splice bytes from a resource that changed under us. Older v1 files
+// lack them and are rejected by `validate`, forcing a safe fresh download.
+pub const STATE_FILE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRange {
@@ -35,6 +38,12 @@ pub struct DownloadState {
     pub version: u32,
     pub url: String,
     pub file_size: u64,
+    /// Resource validator captured when the download started. A resume must
+    /// only proceed if the server still reports the same resource.
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
     pub workers: Vec<WorkerRange>,
 }
 
@@ -44,7 +53,40 @@ impl DownloadState {
             version: STATE_FILE_VERSION,
             url,
             file_size,
+            etag: None,
+            last_modified: None,
             workers,
+        }
+    }
+
+    /// Attach the resource validators discovered while probing.
+    pub fn with_resource_id(mut self, etag: Option<String>, last_modified: Option<String>) -> Self {
+        self.etag = etag;
+        self.last_modified = last_modified;
+        self
+    }
+
+    /// Decide whether this saved state may be resumed against a freshly-probed
+    /// resource. Returns `false` only when there is *positive* evidence the
+    /// resource changed; otherwise it defers to the size check the caller
+    /// already performs (so it is never weaker than having no validators).
+    ///
+    /// A byte-range resume relies on byte-for-byte identity, which only a
+    /// **strong** `ETag` guarantees. A weak validator (`W/"..."`) promises only
+    /// semantic equivalence, so a matching weak `ETag` is *not* enough to
+    /// authorise a resume — we fall through to `Last-Modified` instead.
+    pub fn matches_resource(&self, etag: Option<&str>, last_modified: Option<&str>) -> bool {
+        if let (Some(saved), Some(current)) = (self.etag.as_deref(), etag) {
+            if saved != current {
+                return false;
+            }
+            if !saved.starts_with("W/") {
+                return true;
+            }
+        }
+        match (self.last_modified.as_deref(), last_modified) {
+            (Some(saved), Some(current)) => saved == current,
+            _ => true,
         }
     }
 
@@ -106,8 +148,10 @@ pub fn state_path_for(file_path: &Path) -> PathBuf {
 
 /// Atomically write the state to disk.
 pub async fn save(path: &Path, state: &DownloadState) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| Error::StateCorrupted(format!("serialize: {e}")))?;
+    // Compact (not pretty) JSON: this file is rewritten on a ticker, so the
+    // smaller payload means less to serialize and less to write on each save.
+    let bytes =
+        serde_json::to_vec(state).map_err(|e| Error::StateCorrupted(format!("serialize: {e}")))?;
 
     // Write to a sibling temp file with a stable name, then rename.
     let mut tmp = path.as_os_str().to_owned();
@@ -266,6 +310,43 @@ mod tests {
             }],
         );
         assert!(s.validate().is_err());
+    }
+
+    fn state_with(etag: Option<&str>, last_modified: Option<&str>) -> DownloadState {
+        DownloadState::new("u".into(), 100, vec![])
+            .with_resource_id(etag.map(String::from), last_modified.map(String::from))
+    }
+
+    #[test]
+    fn matches_resource_strong_etag() {
+        let s = state_with(Some("\"abc\""), None);
+        assert!(s.matches_resource(Some("\"abc\""), None));
+        // Changed strong ETag => positive evidence of change => no resume.
+        assert!(!s.matches_resource(Some("\"xyz\""), None));
+    }
+
+    #[test]
+    fn matches_resource_weak_etag_not_trusted() {
+        // Equal weak ETags don't prove byte-identity, so they must not alone
+        // authorise a resume; fall through to Last-Modified.
+        let s = state_with(Some("W/\"abc\""), Some("Mon"));
+        assert!(s.matches_resource(Some("W/\"abc\""), Some("Mon")));
+        assert!(!s.matches_resource(Some("W/\"abc\""), Some("Tue")));
+        // A differing weak ETag is still positive evidence of change.
+        let s2 = state_with(Some("W/\"abc\""), None);
+        assert!(!s2.matches_resource(Some("W/\"def\""), None));
+    }
+
+    #[test]
+    fn matches_resource_falls_back_when_no_validators() {
+        // Nothing to compare: defer to the caller's size check (return true).
+        let s = state_with(None, None);
+        assert!(s.matches_resource(None, None));
+        assert!(s.matches_resource(Some("\"abc\""), None));
+        // Last-Modified only.
+        let s2 = state_with(None, Some("Mon"));
+        assert!(s2.matches_resource(None, Some("Mon")));
+        assert!(!s2.matches_resource(None, Some("Tue")));
     }
 
     #[test]

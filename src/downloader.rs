@@ -28,6 +28,7 @@ use reqwest::{Client, StatusCode, Url};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::checksum::{self, Checksum};
 use crate::error::{Error, Result};
 use crate::http::{self, FileInfo, HttpConfig};
 use crate::progress::{DownloadEvent, ProgressReporter, SpeedMeter};
@@ -52,6 +53,18 @@ pub struct DownloaderConfig {
     pub state_save_interval: Duration,
     /// Per-worker: how many bytes between `flush()` calls.
     pub flush_interval_bytes: u64,
+    /// Verify the finished file against a digest the server advertised
+    /// (`Repr-Digest` / `Digest` / `Content-MD5`) when the caller didn't supply
+    /// one. A caller-supplied checksum is always verified regardless. Costs one
+    /// sequential read+hash of the file, only when a digest is available.
+    pub verify_server_digest: bool,
+    /// Make resume crash-safe against *power loss* (not just process kill):
+    /// `fdatasync`/`fsync` the data file before each resume checkpoint, so the
+    /// saved progress never names bytes the OS hasn't durably written. Off by
+    /// default because the extra syncs cost throughput — the default already
+    /// survives a process kill (the page cache outlives the process); only a
+    /// hard power loss / kernel panic needs this.
+    pub durable_resume: bool,
     /// Per-worker: maximum number of retry attempts before giving up.
     pub max_retries: u32,
     /// Initial backoff between retries; doubles each time up to
@@ -71,6 +84,8 @@ impl Default for DownloaderConfig {
             speed_window: Duration::from_secs(2),
             state_save_interval: Duration::from_secs(2),
             flush_interval_bytes: 4 * 1024 * 1024, // 4 MiB
+            verify_server_digest: true,
+            durable_resume: false,
             max_retries: 8,
             initial_retry_delay: Duration::from_millis(500),
             max_retry_delay: Duration::from_secs(30),
@@ -89,6 +104,11 @@ pub struct DownloadTask {
     pub save_path: PathBuf,
     /// Override the downloader's default thread count for this task.
     pub thread_count: Option<u16>,
+    /// Expected content digest. When set, the finished file is hashed and
+    /// verified against it; a mismatch fails the download and removes the file.
+    /// This is the strongest integrity guard and catches corruption that the
+    /// size / ETag / If-Range checks cannot (e.g. a power-loss resume gap).
+    pub expected_checksum: Option<Checksum>,
 }
 
 impl DownloadTask {
@@ -98,6 +118,7 @@ impl DownloadTask {
             url: url.into(),
             save_path: save_path.into(),
             thread_count: None,
+            expected_checksum: None,
         }
     }
     pub fn with_id(mut self, id: u64) -> Self {
@@ -106,6 +127,11 @@ impl DownloadTask {
     }
     pub fn with_threads(mut self, n: u16) -> Self {
         self.thread_count = Some(n);
+        self
+    }
+    /// Verify the finished file against this digest.
+    pub fn with_checksum(mut self, checksum: Checksum) -> Self {
+        self.expected_checksum = Some(checksum);
         self
     }
 }
@@ -254,6 +280,28 @@ impl Downloader {
                 });
             }
         }
+
+        // End-to-end content verification. The caller's checksum wins; otherwise
+        // fall back to a server-advertised digest (if enabled). This is the only
+        // check that catches corruption the byte-count/validator checks can't —
+        // e.g. a power-loss resume that skipped un-fsynced bytes.
+        let expected_checksum = task.expected_checksum.clone().or_else(|| {
+            if cfg.verify_server_digest {
+                info.digest.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(expected) = expected_checksum {
+            if let Err(e) = checksum::verify_file(&final_path, &expected).await {
+                // The finished file is corrupt: remove it and any resume state so
+                // a rerun starts clean instead of "completing" a bad file again.
+                let _ = tokio::fs::remove_file(&final_path).await;
+                state::delete(&state::state_path_for(&final_path)).await;
+                return Err(e);
+            }
+        }
+
         Ok(DownloadOutcome {
             id,
             path: final_path,
@@ -274,11 +322,18 @@ impl Downloader {
         let file_size = info.size.ok_or(Error::UnknownLength)?;
         let state_path = state::state_path_for(path);
 
-        // Try to load resume state. If the recorded file_size does not match
-        // what the server now reports, the state is from a different version
-        // of the resource and must be thrown away.
+        // Try to load resume state. Throw it away unless the server still
+        // reports the same resource: same length *and* a matching validator
+        // (ETag / Last-Modified). A same-size content change with stale state
+        // would otherwise splice two versions together and corrupt the file.
         let workers: Vec<WorkerRange> = match state::load(&state_path).await {
-            Ok(s) if s.file_size == file_size && !s.workers.is_empty() => s.workers,
+            Ok(s)
+                if s.file_size == file_size
+                    && !s.workers.is_empty()
+                    && s.matches_resource(info.etag.as_deref(), info.last_modified.as_deref()) =>
+            {
+                s.workers
+            }
             _ => state::split_workers(file_size, thread_count, cfg.min_chunk_size),
         };
 
@@ -334,7 +389,11 @@ impl Downloader {
             let ends = ends.clone();
             let currents = currents.clone();
             let url = info.final_url.to_string();
+            let etag = info.etag.clone();
+            let last_modified = info.last_modified.clone();
             let state_path_cl = state_path.clone();
+            let data_path = path.to_path_buf();
+            let durable = cfg.durable_resume;
             let stop = stop_bg.clone();
             let interval = cfg.state_save_interval;
             tokio::spawn(state_save_task(
@@ -342,12 +401,21 @@ impl Downloader {
                 ends,
                 currents,
                 url,
+                etag,
+                last_modified,
                 file_size,
                 state_path_cl,
+                data_path,
+                durable,
                 interval,
                 stop,
             ))
         };
+
+        // Validator sent as `If-Range` on every worker request, so the server
+        // returns 200 (not 206) the instant the resource changes under us —
+        // turning a would-be silent splice into a clean, detectable failure.
+        let if_range = info.if_range_validator().map(|s| s.to_owned());
 
         // ---- workers ----
         let mut handles = Vec::new();
@@ -364,8 +432,12 @@ impl Downloader {
             let path = path.to_path_buf();
             let cfg = cfg.clone();
             let cancel = cancel.clone();
+            let if_range = if_range.clone();
             handles.push(tokio::spawn(async move {
-                worker_loop(client, url, path, end, current, downloaded, cfg, cancel).await
+                worker_loop(
+                    client, url, path, end, current, downloaded, if_range, cfg, cancel,
+                )
+                .await
             }));
         }
 
@@ -400,6 +472,12 @@ impl Downloader {
             return Err(Error::Cancelled);
         }
         if let Some(e) = first_error {
+            // The resource changed mid-flight: the bytes on disk are a mix of
+            // versions, so the saved progress is worthless. Drop it so the next
+            // run re-probes and downloads the new version cleanly.
+            if e.is_resource_changed() {
+                state::delete(&state_path).await;
+            }
             return Err(e);
         }
 
@@ -446,6 +524,8 @@ impl Downloader {
                 path,
                 info.size,
                 info.supports_range,
+                info.if_range_validator(),
+                cfg.durable_resume,
                 id,
                 &self.inner.reporter,
                 cfg,
@@ -540,14 +620,32 @@ async fn state_save_task(
     ends: Vec<u64>,
     currents: Vec<Arc<AtomicU64>>,
     url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
     file_size: u64,
     path: PathBuf,
+    data_path: PathBuf,
+    durable_resume: bool,
     interval: Duration,
     stop: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await; // throw away the immediate first tick
+
+    // When durability is requested, keep a handle to the data file so we can
+    // `fdatasync` it before each checkpoint. The file is pre-allocated to its
+    // full length up front, so only data blocks (not size metadata) need
+    // syncing here — `sync_data` is enough and cheaper than `sync_all`.
+    let sync_file = if durable_resume {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     let snapshot = |starts: &[u64], ends: &[u64], currents: &[Arc<AtomicU64>]| {
         DownloadState::new(
@@ -564,6 +662,23 @@ async fn state_save_task(
                 })
                 .collect(),
         )
+        .with_resource_id(etag.clone(), last_modified.clone())
+    };
+
+    // Snapshot first, then sync, then persist: every byte named by the snapshot
+    // had its `write_all` complete before we read `current`, so it is in the
+    // page cache before the `sync_data` call and therefore durable once it
+    // returns. The saved state can never get ahead of durable bytes.
+    let checkpoint = |starts: &[u64], ends: &[u64], currents: &[Arc<AtomicU64>]| {
+        let s = snapshot(starts, ends, currents);
+        let sync_file = &sync_file;
+        let path = &path;
+        async move {
+            if let Some(f) = sync_file.as_ref() {
+                let _ = f.sync_data().await;
+            }
+            let _ = state::save(path, &s).await;
+        }
     };
 
     loop {
@@ -571,15 +686,13 @@ async fn state_save_task(
             biased;
             _ = stop.cancelled() => break,
             _ = ticker.tick() => {
-                let s = snapshot(&starts, &ends, &currents);
-                let _ = state::save(&path, &s).await;
+                checkpoint(&starts, &ends, &currents).await;
             }
         }
     }
-    // Always save once on shutdown so a cancellation or error preserves
+    // Always checkpoint once on shutdown so a cancellation or error preserves
     // resume state.
-    let s = snapshot(&starts, &ends, &currents);
-    let _ = state::save(&path, &s).await;
+    checkpoint(&starts, &ends, &currents).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +707,7 @@ async fn worker_loop(
     end: u64,
     current: Arc<AtomicU64>,
     downloaded: Arc<AtomicU64>,
+    if_range: Option<String>,
     cfg: DownloaderConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -612,6 +726,7 @@ async fn worker_loop(
             end,
             &current,
             &downloaded,
+            if_range.as_deref(),
             &cfg,
             &cancel,
         )
@@ -625,6 +740,10 @@ async fn worker_loop(
             // 200 to a Range request mid-download. We can't recover within
             // multi-thread mode; surface it to the orchestrator.
             Err(Error::NoRangeSupport) => return Err(Error::NoRangeSupport),
+            // The resource changed under us (If-Range rejected): retrying can't
+            // help and the bytes on disk are now a mix of versions. Surface it
+            // so the orchestrator discards the state instead of corrupting.
+            Err(Error::ResourceChanged) => return Err(Error::ResourceChanged),
             Err(e) => {
                 attempt += 1;
                 if attempt >= cfg.max_retries {
@@ -653,6 +772,7 @@ async fn download_segment(
     end: u64,
     current: &AtomicU64,
     downloaded: &AtomicU64,
+    if_range: Option<&str>,
     cfg: &DownloaderConfig,
     cancel: &CancellationToken,
 ) -> Result<()> {
@@ -660,20 +780,29 @@ async fn download_segment(
         return Ok(());
     }
     let range = format!("bytes={}-{}", start, end - 1);
-    let resp = client
+    let mut req = client
         .get(url.as_str())
         .header(reqwest::header::RANGE, &range)
-        .timeout(cfg.http.chunk_request_timeout)
-        .send()
-        .await?;
+        .timeout(cfg.http.chunk_request_timeout);
+    if let Some(v) = if_range {
+        req = req.header(reqwest::header::IF_RANGE, v);
+    }
+    let resp = req.send().await?;
 
     match resp.status() {
         StatusCode::PARTIAL_CONTENT => {}
+        // A 200 to a Range request means the server served the whole entity.
+        // With `If-Range` set that specifically means the validator no longer
+        // matches (the resource changed); without it, the server just ignores
+        // ranges. Distinguish so the orchestrator can react correctly.
+        StatusCode::OK if if_range.is_some() => return Err(Error::ResourceChanged),
         StatusCode::OK => return Err(Error::NoRangeSupport),
         StatusCode::RANGE_NOT_SATISFIABLE => {
             // The state file thinks this worker still has bytes to fetch, but
-            // the server says the range is unsatisfiable. Treat as done and
-            // let the orchestrator's byte-count check catch real corruption.
+            // the server says the range is unsatisfiable. Mark the worker done
+            // so its loop can't spin re-issuing the same doomed request; the
+            // orchestrator's byte-count check still catches real corruption.
+            current.store(end, Ordering::Relaxed);
             return Ok(());
         }
         s => return Err(Error::Status(s)),
@@ -736,6 +865,8 @@ async fn single_thread_attempt(
     path: &Path,
     expected_size: Option<u64>,
     server_supports_range: bool,
+    if_range: Option<&str>,
+    durable_resume: bool,
     id: u64,
     reporter: &Arc<dyn ProgressReporter>,
     cfg: &DownloaderConfig,
@@ -760,6 +891,13 @@ async fn single_thread_attempt(
         .timeout(cfg.http.chunk_request_timeout);
     if attempt_resume {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+        // If the resource changed, `If-Range` makes the server reply 200 (full
+        // body) instead of 206. The `(true, OK)` arm below then truncates and
+        // re-downloads from zero — so a changed resource self-heals here rather
+        // than appending new bytes onto stale ones.
+        if let Some(v) = if_range {
+            request = request.header(reqwest::header::IF_RANGE, v);
+        }
     }
 
     let resp = tokio::select! {
@@ -866,6 +1004,11 @@ async fn single_thread_attempt(
             bytes_since_flush += write_len as u64;
             if bytes_since_flush >= cfg.flush_interval_bytes {
                 file.flush().await?;
+                if durable_resume {
+                    // This file grows as we write, so a length-based resume needs
+                    // the size metadata durable too — full fsync, not fdatasync.
+                    file.sync_all().await?;
+                }
                 bytes_since_flush = 0;
             }
         }
