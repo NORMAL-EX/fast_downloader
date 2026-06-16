@@ -24,6 +24,12 @@ pub enum Error {
     #[error("byte total mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 
+    #[error("checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+
+    #[error("invalid checksum: {0}")]
+    InvalidChecksum(String),
+
     #[error("download cancelled")]
     Cancelled,
 
@@ -58,5 +64,11 @@ impl Error {
     /// a fresh download is required (re-running does this automatically).
     pub fn is_resource_changed(&self) -> bool {
         matches!(self, Error::ResourceChanged)
+    }
+
+    /// True if the completed file failed content verification. The corrupt file
+    /// is removed, so re-running performs a clean fresh download.
+    pub fn is_checksum_mismatch(&self) -> bool {
+        matches!(self, Error::ChecksumMismatch { .. })
     }
 }

@@ -46,6 +46,9 @@ pub struct ServerBehavior {
     /// full `200` (as a real server does when the validator no longer matches),
     /// simulating a resource that changed after it was probed.
     pub if_range_stale: bool,
+    /// Optional `Repr-Digest` header value (e.g. `sha-256=:<base64>:`) advertised
+    /// on the HEAD response for end-to-end verification tests.
+    pub repr_digest: Option<String>,
 }
 
 pub struct TestServer {
@@ -154,6 +157,9 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
         }
         if let Some(etag) = &behavior.etag {
             h.insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+        }
+        if let Some(d) = &behavior.repr_digest {
+            h.insert("repr-digest", HeaderValue::from_str(d).unwrap());
         }
         return resp.body(Body::empty()).unwrap();
     }

@@ -17,6 +17,9 @@ percent-encoding = "2"
 thiserror = "1"
 tracing = "0.1"
 tokio-util = "0.7"
+sha2 = "0.10"
+md-5 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["http2"] }
@@ -27,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 rand = "0.8"
 sha2 = "0.10"
+base64 = "0.22"
 
 [[example]]
 name = "basic"

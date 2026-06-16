@@ -16,6 +16,13 @@ speed reporting.
   cleanly (and clears the stale state) while the single-thread path truncates
   and re-fetches. Unchanged (or validator-less) resources resume exactly as
   before, at no extra cost.
+- **End-to-end checksum verification** (opt-in): pass an expected digest via
+  `DownloadTask::with_checksum(...)`, or let the downloader auto-verify against a
+  server `Repr-Digest` / `Digest` / `Content-MD5`. On completion the file is
+  hashed and a mismatch fails the download and removes the file. This is the only
+  check that also catches a power-loss resume gap or on-disk bit-rot. Runs only
+  when a digest is available, so it costs nothing otherwise (toggle the
+  server-digest path with `DownloaderConfig::verify_server_digest`).
 - **Single-thread fallback** when the server does not support Range, with
   Range-based resume for that path too.
 - **No shared file mutex**: each worker holds its own file descriptor and

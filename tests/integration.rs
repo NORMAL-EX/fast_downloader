@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::prelude::*;
 use common::{make_content, sha256, ServerBehavior, TestServer};
 use fast_downloader::{
-    CancellationToken, DownloadEvent, DownloadQueue, DownloadTask, Downloader, DownloaderConfig,
-    NoopReporter, ProgressReporter,
+    CancellationToken, Checksum, DownloadEvent, DownloadQueue, DownloadTask, Downloader,
+    DownloaderConfig, NoopReporter, ProgressReporter,
 };
 
 /// Capture all events emitted during a test so we can assert on them later.
@@ -589,6 +590,128 @@ async fn if_range_single_thread_restarts_on_change() {
         want_v2,
         "single-thread resume must heal a changed resource, not corrupt it"
     );
+}
+
+#[tokio::test]
+async fn caller_checksum_accepts_correct_file() {
+    let content = make_content(512 * 1024, 3);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("ck.bin");
+    let task = DownloadTask::new(server.url("/ck.bin"), dest.clone())
+        .with_threads(8)
+        .with_checksum(Checksum::Sha256(want));
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, 512 * 1024);
+    assert!(dest.exists());
+}
+
+#[tokio::test]
+async fn caller_checksum_rejects_and_removes_bad_file() {
+    let content = make_content(512 * 1024, 3);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("ck.bin");
+    // Wrong expected hash -> verification must fail and remove the file.
+    let task = DownloadTask::new(server.url("/ck.bin"), dest.clone())
+        .with_threads(8)
+        .with_checksum(Checksum::Sha256([0u8; 32]));
+    let err = dl
+        .download(task, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.is_checksum_mismatch(), "got {err}");
+    assert!(
+        !dest.exists(),
+        "a file that fails verification must be removed"
+    );
+}
+
+#[tokio::test]
+async fn server_repr_digest_is_verified() {
+    let content = make_content(300 * 1024, 8);
+    let good = format!("sha-256=:{}:", BASE64_STANDARD.encode(sha256(&content)));
+
+    // Correct server digest, no caller checksum -> auto-verified, succeeds.
+    let server = TestServer::start(
+        content.clone(),
+        ServerBehavior {
+            support_range: true,
+            repr_digest: Some(good),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("d.bin");
+    let task = DownloadTask::new(server.url("/d.bin"), dest.clone()).with_threads(8);
+    dl.download(task, CancellationToken::new()).await.unwrap();
+    assert!(dest.exists());
+
+    // Wrong server digest -> auto-verification fails and removes the file.
+    let bad = format!("sha-256=:{}:", BASE64_STANDARD.encode([0u8; 32]));
+    let server2 = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            repr_digest: Some(bad),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dest2 = tmp.path().join("d2.bin");
+    let task = DownloadTask::new(server2.url("/d2.bin"), dest2.clone()).with_threads(8);
+    let err = dl
+        .download(task, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.is_checksum_mismatch(), "got {err}");
+    assert!(!dest2.exists());
+}
+
+#[tokio::test]
+async fn server_digest_verification_can_be_disabled() {
+    let content = make_content(128 * 1024, 9);
+    let bad = format!("sha-256=:{}:", BASE64_STANDARD.encode([0u8; 32]));
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            repr_digest: Some(bad), // would fail if honored
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.verify_server_digest = false;
+    let dl = Downloader::with_config(cfg, Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("nd.bin");
+    let task = DownloadTask::new(server.url("/nd.bin"), dest.clone()).with_threads(8);
+    // With server-digest verification off, the bogus digest is ignored.
+    dl.download(task, CancellationToken::new()).await.unwrap();
+    assert!(dest.exists());
 }
 
 #[tokio::test]
