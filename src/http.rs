@@ -77,6 +77,19 @@ pub struct FileInfo {
     pub last_modified: Option<String>,
 }
 
+impl FileInfo {
+    /// Validator to send in `If-Range` so the server only honours a Range
+    /// request while the resource is unchanged. RFC 9110 forbids a *weak* ETag
+    /// here (it doesn't imply byte-for-byte identity), so we fall back to
+    /// `Last-Modified` in that case.
+    pub fn if_range_validator(&self) -> Option<&str> {
+        match self.etag.as_deref() {
+            Some(e) if !e.starts_with("W/") => Some(e),
+            _ => self.last_modified.as_deref(),
+        }
+    }
+}
+
 /// Probe a URL using HEAD and, when necessary, a tiny Range GET, to discover
 /// total size and range support.
 ///

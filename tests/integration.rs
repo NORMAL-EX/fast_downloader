@@ -516,6 +516,82 @@ async fn matching_etag_still_resumes() {
 }
 
 #[tokio::test]
+async fn if_range_detects_change_multithread() {
+    // The server reports the resource changed since it was probed (it answers
+    // any If-Range request with a full 200). A multi-thread worker must surface
+    // this as ResourceChanged — failing safe — instead of splicing versions.
+    let content = make_content(512 * 1024, 5);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            etag: Some("\"v1\"".into()),
+            if_range_stale: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("changed.bin");
+    let task = DownloadTask::new(server.url("/changed.bin"), dest.clone()).with_threads(4);
+    let err = dl
+        .download(task, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_resource_changed(),
+        "expected ResourceChanged, got {err}"
+    );
+
+    // The now-worthless state must be cleared so a rerun starts fresh.
+    let mut state_path = dest.into_os_string();
+    state_path.push(".dlstate");
+    assert!(
+        !PathBuf::from(state_path).exists(),
+        "stale state not cleared"
+    );
+}
+
+#[tokio::test]
+async fn if_range_single_thread_restarts_on_change() {
+    // A half-written file from an old version exists; the server then reports a
+    // change on the If-Range resume request. The single-thread path must
+    // truncate and re-fetch rather than append new bytes onto stale ones.
+    let size = 256 * 1024usize;
+    let content_v1 = make_content(size, 1);
+    let content_v2 = make_content(size, 2);
+    let want_v2 = sha256(&content_v2);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("s.bin");
+    std::fs::write(&dest, &content_v1[..size / 2]).unwrap(); // stale partial
+
+    let server = TestServer::start(
+        content_v2.clone(),
+        ServerBehavior {
+            support_range: true,
+            etag: Some("\"v2\"".into()),
+            if_range_stale: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    // threads = 1 forces the single-thread path.
+    let task = DownloadTask::new(server.url("/s.bin"), dest.clone()).with_threads(1);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, size as u64);
+    assert_eq!(
+        sha256(&std::fs::read(&dest).unwrap()),
+        want_v2,
+        "single-thread resume must heal a changed resource, not corrupt it"
+    );
+}
+
+#[tokio::test]
 async fn empty_file_downloads_cleanly() {
     let server = TestServer::start(
         Vec::new(),

@@ -360,6 +360,11 @@ impl Downloader {
             ))
         };
 
+        // Validator sent as `If-Range` on every worker request, so the server
+        // returns 200 (not 206) the instant the resource changes under us —
+        // turning a would-be silent splice into a clean, detectable failure.
+        let if_range = info.if_range_validator().map(|s| s.to_owned());
+
         // ---- workers ----
         let mut handles = Vec::new();
         for i in 0..currents.len() {
@@ -375,8 +380,12 @@ impl Downloader {
             let path = path.to_path_buf();
             let cfg = cfg.clone();
             let cancel = cancel.clone();
+            let if_range = if_range.clone();
             handles.push(tokio::spawn(async move {
-                worker_loop(client, url, path, end, current, downloaded, cfg, cancel).await
+                worker_loop(
+                    client, url, path, end, current, downloaded, if_range, cfg, cancel,
+                )
+                .await
             }));
         }
 
@@ -411,6 +420,12 @@ impl Downloader {
             return Err(Error::Cancelled);
         }
         if let Some(e) = first_error {
+            // The resource changed mid-flight: the bytes on disk are a mix of
+            // versions, so the saved progress is worthless. Drop it so the next
+            // run re-probes and downloads the new version cleanly.
+            if e.is_resource_changed() {
+                state::delete(&state_path).await;
+            }
             return Err(e);
         }
 
@@ -457,6 +472,7 @@ impl Downloader {
                 path,
                 info.size,
                 info.supports_range,
+                info.if_range_validator(),
                 id,
                 &self.inner.reporter,
                 cfg,
@@ -608,6 +624,7 @@ async fn worker_loop(
     end: u64,
     current: Arc<AtomicU64>,
     downloaded: Arc<AtomicU64>,
+    if_range: Option<String>,
     cfg: DownloaderConfig,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -626,6 +643,7 @@ async fn worker_loop(
             end,
             &current,
             &downloaded,
+            if_range.as_deref(),
             &cfg,
             &cancel,
         )
@@ -639,6 +657,10 @@ async fn worker_loop(
             // 200 to a Range request mid-download. We can't recover within
             // multi-thread mode; surface it to the orchestrator.
             Err(Error::NoRangeSupport) => return Err(Error::NoRangeSupport),
+            // The resource changed under us (If-Range rejected): retrying can't
+            // help and the bytes on disk are now a mix of versions. Surface it
+            // so the orchestrator discards the state instead of corrupting.
+            Err(Error::ResourceChanged) => return Err(Error::ResourceChanged),
             Err(e) => {
                 attempt += 1;
                 if attempt >= cfg.max_retries {
@@ -667,6 +689,7 @@ async fn download_segment(
     end: u64,
     current: &AtomicU64,
     downloaded: &AtomicU64,
+    if_range: Option<&str>,
     cfg: &DownloaderConfig,
     cancel: &CancellationToken,
 ) -> Result<()> {
@@ -674,15 +697,22 @@ async fn download_segment(
         return Ok(());
     }
     let range = format!("bytes={}-{}", start, end - 1);
-    let resp = client
+    let mut req = client
         .get(url.as_str())
         .header(reqwest::header::RANGE, &range)
-        .timeout(cfg.http.chunk_request_timeout)
-        .send()
-        .await?;
+        .timeout(cfg.http.chunk_request_timeout);
+    if let Some(v) = if_range {
+        req = req.header(reqwest::header::IF_RANGE, v);
+    }
+    let resp = req.send().await?;
 
     match resp.status() {
         StatusCode::PARTIAL_CONTENT => {}
+        // A 200 to a Range request means the server served the whole entity.
+        // With `If-Range` set that specifically means the validator no longer
+        // matches (the resource changed); without it, the server just ignores
+        // ranges. Distinguish so the orchestrator can react correctly.
+        StatusCode::OK if if_range.is_some() => return Err(Error::ResourceChanged),
         StatusCode::OK => return Err(Error::NoRangeSupport),
         StatusCode::RANGE_NOT_SATISFIABLE => {
             // The state file thinks this worker still has bytes to fetch, but
@@ -752,6 +782,7 @@ async fn single_thread_attempt(
     path: &Path,
     expected_size: Option<u64>,
     server_supports_range: bool,
+    if_range: Option<&str>,
     id: u64,
     reporter: &Arc<dyn ProgressReporter>,
     cfg: &DownloaderConfig,
@@ -776,6 +807,13 @@ async fn single_thread_attempt(
         .timeout(cfg.http.chunk_request_timeout);
     if attempt_resume {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+        // If the resource changed, `If-Range` makes the server reply 200 (full
+        // body) instead of 206. The `(true, OK)` arm below then truncates and
+        // re-downloads from zero — so a changed resource self-heals here rather
+        // than appending new bytes onto stale ones.
+        if let Some(v) = if_range {
+            request = request.header(reqwest::header::IF_RANGE, v);
+        }
     }
 
     let resp = tokio::select! {

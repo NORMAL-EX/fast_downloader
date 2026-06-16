@@ -10,10 +10,12 @@ speed reporting.
 - **Resumable**: state is persisted to `<file>.dlstate` and atomically rewritten
   on a ticker; interrupted downloads continue where they left off.
 - **Validated resume**: the resume state records the resource's `ETag` /
-  `Last-Modified`. If the server reports a different validator on the next run,
-  the stale state is discarded and the file re-fetched, so a same-size change on
-  the server can never splice two versions together. A matching (or absent)
-  validator resumes as before.
+  `Last-Modified`, and every range request carries `If-Range`. A server that
+  has changed the resource then answers `200` instead of `206`, so a same-size
+  change can never splice two versions together — the multi-thread path fails
+  cleanly (and clears the stale state) while the single-thread path truncates
+  and re-fetches. Unchanged (or validator-less) resources resume exactly as
+  before, at no extra cost.
 - **Single-thread fallback** when the server does not support Range, with
   Range-based resume for that path too.
 - **No shared file mutex**: each worker holds its own file descriptor and

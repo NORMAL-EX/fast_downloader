@@ -42,6 +42,10 @@ pub struct ServerBehavior {
     pub chunk_size: usize,
     /// Optional `ETag` to advertise on HEAD and GET responses.
     pub etag: Option<String>,
+    /// When true, any request carrying an `If-Range` header is answered with a
+    /// full `200` (as a real server does when the validator no longer matches),
+    /// simulating a resource that changed after it was probed.
+    pub if_range_stale: bool,
 }
 
 pub struct TestServer {
@@ -157,15 +161,19 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
     state.stats.get_requests.fetch_add(1, Ordering::Relaxed);
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let range_parsed = range.and_then(parse_range_single);
+    // A real server answers a stale If-Range with the full 200 body.
+    let if_range_stale = behavior.if_range_stale && headers.contains_key(header::IF_RANGE);
 
     // Decide if we honour Range.
     let (status, start, end) = match range_parsed {
-        Some((s, e)) if behavior.support_range && !behavior.answer_range_with_200 => {
+        Some((s, e))
+            if behavior.support_range && !behavior.answer_range_with_200 && !if_range_stale =>
+        {
             state.stats.range_requests.fetch_add(1, Ordering::Relaxed);
             (StatusCode::PARTIAL_CONTENT, s, e)
         }
         Some(_) => {
-            // Range requested but server ignores it.
+            // Range ignored (server doesn't support it, or If-Range went stale).
             (StatusCode::OK, 0, total.saturating_sub(1))
         }
         None => (StatusCode::OK, 0, total.saturating_sub(1)),
