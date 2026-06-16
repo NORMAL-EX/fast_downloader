@@ -106,8 +106,10 @@ pub fn state_path_for(file_path: &Path) -> PathBuf {
 
 /// Atomically write the state to disk.
 pub async fn save(path: &Path, state: &DownloadState) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|e| Error::StateCorrupted(format!("serialize: {e}")))?;
+    // Compact (not pretty) JSON: this file is rewritten on a ticker, so the
+    // smaller payload means less to serialize and less to write on each save.
+    let bytes =
+        serde_json::to_vec(state).map_err(|e| Error::StateCorrupted(format!("serialize: {e}")))?;
 
     // Write to a sibling temp file with a stable name, then rename.
     let mut tmp = path.as_os_str().to_owned();

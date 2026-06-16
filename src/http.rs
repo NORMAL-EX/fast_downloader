@@ -45,6 +45,10 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client> {
         .user_agent(&cfg.user_agent)
         .connect_timeout(cfg.connect_timeout)
         .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
+        // reqwest already defaults this on; set it explicitly so a future
+        // default change can't silently let Nagle delay our small range
+        // requests behind unacked bulk data.
+        .tcp_nodelay(true)
         // We do not set a global `timeout()` because that would also kill
         // long-running streamed chunk transfers. Per-request timeouts are
         // attached individually.

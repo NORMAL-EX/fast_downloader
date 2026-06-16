@@ -672,8 +672,10 @@ async fn download_segment(
         StatusCode::OK => return Err(Error::NoRangeSupport),
         StatusCode::RANGE_NOT_SATISFIABLE => {
             // The state file thinks this worker still has bytes to fetch, but
-            // the server says the range is unsatisfiable. Treat as done and
-            // let the orchestrator's byte-count check catch real corruption.
+            // the server says the range is unsatisfiable. Mark the worker done
+            // so its loop can't spin re-issuing the same doomed request; the
+            // orchestrator's byte-count check still catches real corruption.
+            current.store(end, Ordering::Relaxed);
             return Ok(());
         }
         s => return Err(Error::Status(s)),
