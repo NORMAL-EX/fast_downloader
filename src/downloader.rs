@@ -28,6 +28,7 @@ use reqwest::{Client, StatusCode, Url};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::checksum::{self, Checksum};
 use crate::error::{Error, Result};
 use crate::http::{self, FileInfo, HttpConfig};
 use crate::progress::{DownloadEvent, ProgressReporter, SpeedMeter};
@@ -52,6 +53,11 @@ pub struct DownloaderConfig {
     pub state_save_interval: Duration,
     /// Per-worker: how many bytes between `flush()` calls.
     pub flush_interval_bytes: u64,
+    /// Verify the finished file against a digest the server advertised
+    /// (`Repr-Digest` / `Digest` / `Content-MD5`) when the caller didn't supply
+    /// one. A caller-supplied checksum is always verified regardless. Costs one
+    /// sequential read+hash of the file, only when a digest is available.
+    pub verify_server_digest: bool,
     /// Per-worker: maximum number of retry attempts before giving up.
     pub max_retries: u32,
     /// Initial backoff between retries; doubles each time up to
@@ -71,6 +77,7 @@ impl Default for DownloaderConfig {
             speed_window: Duration::from_secs(2),
             state_save_interval: Duration::from_secs(2),
             flush_interval_bytes: 4 * 1024 * 1024, // 4 MiB
+            verify_server_digest: true,
             max_retries: 8,
             initial_retry_delay: Duration::from_millis(500),
             max_retry_delay: Duration::from_secs(30),
@@ -89,6 +96,11 @@ pub struct DownloadTask {
     pub save_path: PathBuf,
     /// Override the downloader's default thread count for this task.
     pub thread_count: Option<u16>,
+    /// Expected content digest. When set, the finished file is hashed and
+    /// verified against it; a mismatch fails the download and removes the file.
+    /// This is the strongest integrity guard and catches corruption that the
+    /// size / ETag / If-Range checks cannot (e.g. a power-loss resume gap).
+    pub expected_checksum: Option<Checksum>,
 }
 
 impl DownloadTask {
@@ -98,6 +110,7 @@ impl DownloadTask {
             url: url.into(),
             save_path: save_path.into(),
             thread_count: None,
+            expected_checksum: None,
         }
     }
     pub fn with_id(mut self, id: u64) -> Self {
@@ -106,6 +119,11 @@ impl DownloadTask {
     }
     pub fn with_threads(mut self, n: u16) -> Self {
         self.thread_count = Some(n);
+        self
+    }
+    /// Verify the finished file against this digest.
+    pub fn with_checksum(mut self, checksum: Checksum) -> Self {
+        self.expected_checksum = Some(checksum);
         self
     }
 }
@@ -254,6 +272,28 @@ impl Downloader {
                 });
             }
         }
+
+        // End-to-end content verification. The caller's checksum wins; otherwise
+        // fall back to a server-advertised digest (if enabled). This is the only
+        // check that catches corruption the byte-count/validator checks can't —
+        // e.g. a power-loss resume that skipped un-fsynced bytes.
+        let expected_checksum = task.expected_checksum.clone().or_else(|| {
+            if cfg.verify_server_digest {
+                info.digest.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(expected) = expected_checksum {
+            if let Err(e) = checksum::verify_file(&final_path, &expected).await {
+                // The finished file is corrupt: remove it and any resume state so
+                // a rerun starts clean instead of "completing" a bad file again.
+                let _ = tokio::fs::remove_file(&final_path).await;
+                state::delete(&state::state_path_for(&final_path)).await;
+                return Err(e);
+            }
+        }
+
         Ok(DownloadOutcome {
             id,
             path: final_path,

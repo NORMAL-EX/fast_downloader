@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+mod checksum;
 mod downloader;
 mod error;
 mod filename;
@@ -30,6 +31,7 @@ mod progress;
 mod queue;
 mod state;
 
+pub use checksum::Checksum;
 pub use downloader::{DownloadOutcome, DownloadTask, Downloader, DownloaderConfig};
 pub use error::{Error, Result};
 pub use filename::{derive_filename, parse_content_disposition, sanitize as sanitize_filename};

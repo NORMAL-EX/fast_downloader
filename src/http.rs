@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use reqwest::{Client, StatusCode, Url};
 
+use crate::checksum::{self, Checksum};
 use crate::error::{Error, Result};
 use crate::filename;
 
@@ -75,6 +76,10 @@ pub struct FileInfo {
     pub etag: Option<String>,
     /// Secondary validator, checked when no `ETag` is available on both sides.
     pub last_modified: Option<String>,
+    /// Strongest content digest the server advertised for the full
+    /// representation (from `Repr-Digest` / `Digest` / `Content-MD5`), if any.
+    /// Used for end-to-end verification when the caller supplies no checksum.
+    pub digest: Option<Checksum>,
 }
 
 impl FileInfo {
@@ -122,6 +127,9 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
     let mut supports_range: Option<bool> = None;
     let mut etag: Option<String> = None;
     let mut last_modified: Option<String> = None;
+    // Captured only from HEAD (or a full 200): a digest from a 206 range probe
+    // could describe just the probed byte, not the whole representation.
+    let mut digest: Option<Checksum> = None;
 
     if let Ok(resp) = head {
         if resp.status().is_success() {
@@ -143,6 +151,12 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
                 .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            let h = resp.headers();
+            digest = checksum::digest_from_parts(
+                h.get("repr-digest").and_then(|v| v.to_str().ok()),
+                h.get("digest").and_then(|v| v.to_str().ok()),
+                h.get("content-md5").and_then(|v| v.to_str().ok()),
+            );
             let ar = resp
                 .headers()
                 .get(reqwest::header::ACCEPT_RANGES)
@@ -162,6 +176,7 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
                     supports_range: true,
                     etag,
                     last_modified,
+                    digest,
                 });
             }
         }
@@ -231,6 +246,7 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
         supports_range: confirmed_range || supports_range == Some(true),
         etag,
         last_modified,
+        digest,
     })
 }
 
