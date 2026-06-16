@@ -274,11 +274,18 @@ impl Downloader {
         let file_size = info.size.ok_or(Error::UnknownLength)?;
         let state_path = state::state_path_for(path);
 
-        // Try to load resume state. If the recorded file_size does not match
-        // what the server now reports, the state is from a different version
-        // of the resource and must be thrown away.
+        // Try to load resume state. Throw it away unless the server still
+        // reports the same resource: same length *and* a matching validator
+        // (ETag / Last-Modified). A same-size content change with stale state
+        // would otherwise splice two versions together and corrupt the file.
         let workers: Vec<WorkerRange> = match state::load(&state_path).await {
-            Ok(s) if s.file_size == file_size && !s.workers.is_empty() => s.workers,
+            Ok(s)
+                if s.file_size == file_size
+                    && !s.workers.is_empty()
+                    && s.matches_resource(info.etag.as_deref(), info.last_modified.as_deref()) =>
+            {
+                s.workers
+            }
             _ => state::split_workers(file_size, thread_count, cfg.min_chunk_size),
         };
 
@@ -334,6 +341,8 @@ impl Downloader {
             let ends = ends.clone();
             let currents = currents.clone();
             let url = info.final_url.to_string();
+            let etag = info.etag.clone();
+            let last_modified = info.last_modified.clone();
             let state_path_cl = state_path.clone();
             let stop = stop_bg.clone();
             let interval = cfg.state_save_interval;
@@ -342,6 +351,8 @@ impl Downloader {
                 ends,
                 currents,
                 url,
+                etag,
+                last_modified,
                 file_size,
                 state_path_cl,
                 interval,
@@ -540,6 +551,8 @@ async fn state_save_task(
     ends: Vec<u64>,
     currents: Vec<Arc<AtomicU64>>,
     url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
     file_size: u64,
     path: PathBuf,
     interval: Duration,
@@ -564,6 +577,7 @@ async fn state_save_task(
                 })
                 .collect(),
         )
+        .with_resource_id(etag.clone(), last_modified.clone())
     };
 
     loop {

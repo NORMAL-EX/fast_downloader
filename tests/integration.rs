@@ -429,6 +429,93 @@ async fn etag_unaware_resume_invalidates_when_size_changes() {
 }
 
 #[tokio::test]
+async fn etag_change_invalidates_resume_same_size() {
+    // The corruption case ETag validation closes: a prior run left partial bytes
+    // of one version on disk, then the server's content changed to a *different
+    // file of the same size* with a new ETag. A size-only resume check would
+    // splice the old partial bytes with new ones (corruption); with ETag
+    // validation the stale state must be discarded and the new content fetched.
+    //
+    // The prior-run state is constructed deterministically (a half-written file
+    // plus a matching `.dlstate`) so the test exercises the resume *decision*
+    // directly, with no dependence on interrupt timing or how a server's
+    // mid-stream drop is surfaced.
+    let size = 512 * 1024usize;
+    let half = size / 2;
+    let content_v1 = make_content(size, 21);
+    let content_v2 = make_content(size, 22);
+    let want_v2 = sha256(&content_v2);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("etag.bin");
+
+    // Half-written file: v1's first half on disk, the rest still zero-filled.
+    let mut partial = content_v1[..half].to_vec();
+    partial.resize(size, 0);
+    std::fs::write(&dest, &partial).unwrap();
+
+    // A resume state tagged with the OLD validator, recording that single
+    // [0, size) worker is half-done. (Hand-written to match the on-disk format.)
+    let mut state_path = dest.clone().into_os_string();
+    state_path.push(".dlstate");
+    let state_path = PathBuf::from(state_path);
+    let state_json = format!(
+        r#"{{"version":2,"url":"http://old/etag.bin","file_size":{size},"etag":"\"v1\"","last_modified":null,"workers":[{{"start":0,"current":{half},"end":{size}}}]}}"#
+    );
+    std::fs::write(&state_path, state_json).unwrap();
+
+    // Server now serves different bytes of the same size, with a new ETag.
+    let server = TestServer::start(
+        content_v2.clone(),
+        ServerBehavior {
+            support_range: true,
+            etag: Some("\"v2\"".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    // threads > 1 so we take the multi-thread path that consults the state file.
+    let task = DownloadTask::new(server.url("/etag.bin"), dest.clone()).with_threads(4);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, size as u64);
+    assert_eq!(
+        sha256(&std::fs::read(&dest).unwrap()),
+        want_v2,
+        "a changed ETag must not be resumed into — the file would be corrupt"
+    );
+}
+
+#[tokio::test]
+async fn matching_etag_still_resumes() {
+    // The flip side: when the ETag is unchanged, resume must still work so the
+    // safety check doesn't cost us efficiency on the happy path.
+    let content = make_content(512 * 1024, 99);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content.clone(),
+        ServerBehavior {
+            support_range: true,
+            drop_first_n_responses: 4, // force at least one resume
+            chunk_size: 8 * 1024,
+            etag: Some("\"stable\"".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let dl = Downloader::with_config(test_config(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("stable.bin");
+    let task = DownloadTask::new(server.url("/stable.bin"), dest.clone()).with_threads(8);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, content.len() as u64);
+    assert_eq!(sha256(&std::fs::read(&dest).unwrap()), want);
+    assert!(server.stats.dropped_responses.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
 async fn empty_file_downloads_cleanly() {
     let server = TestServer::start(
         Vec::new(),

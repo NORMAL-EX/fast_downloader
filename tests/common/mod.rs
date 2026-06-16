@@ -40,6 +40,8 @@ pub struct ServerBehavior {
     pub chunk_delay_ms: u64,
     /// Optional fixed chunk size for streaming. 0 = let axum decide.
     pub chunk_size: usize,
+    /// Optional `ETag` to advertise on HEAD and GET responses.
+    pub etag: Option<String>,
 }
 
 pub struct TestServer {
@@ -145,6 +147,9 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
                 header::CONTENT_DISPOSITION,
                 HeaderValue::from_str(cd).unwrap(),
             );
+        }
+        if let Some(etag) = &behavior.etag {
+            h.insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
         }
         return resp.body(Body::empty()).unwrap();
     }
@@ -302,6 +307,9 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
             header::CONTENT_DISPOSITION,
             HeaderValue::from_str(cd).unwrap(),
         );
+    }
+    if let Some(etag) = &behavior.etag {
+        hmap.insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
     }
     {
         let h = builder.headers_mut().unwrap();
