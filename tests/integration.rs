@@ -715,6 +715,61 @@ async fn server_digest_verification_can_be_disabled() {
 }
 
 #[tokio::test]
+async fn durable_resume_multithread_recovers() {
+    // `durable_resume` fdatasyncs the data file before each checkpoint. We can't
+    // crash-test power loss here, but this drives that path under a real resume
+    // and confirms it still yields the correct file (i.e. the extra syncs and
+    // the second data-file handle don't break the download).
+    let content = make_content(512 * 1024, 99);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            drop_first_n_responses: 4,
+            chunk_size: 8 * 1024,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.durable_resume = true;
+    let dl = Downloader::with_config(cfg, Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dur.bin");
+    let task = DownloadTask::new(server.url("/dur.bin"), dest.clone()).with_threads(8);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, 512 * 1024);
+    assert_eq!(sha256(&std::fs::read(&dest).unwrap()), want);
+}
+
+#[tokio::test]
+async fn durable_resume_single_thread_ok() {
+    let content = make_content(96 * 1024, 7);
+    let want = sha256(&content);
+    let server = TestServer::start(
+        content,
+        ServerBehavior {
+            support_range: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut cfg = test_config();
+    cfg.durable_resume = true;
+    cfg.flush_interval_bytes = 16 * 1024; // force several fsyncs across the file
+    let dl = Downloader::with_config(cfg, Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("durs.bin");
+    let task = DownloadTask::new(server.url("/durs.bin"), dest.clone()).with_threads(1);
+    let outcome = dl.download(task, CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome.size, 96 * 1024);
+    assert_eq!(sha256(&std::fs::read(&dest).unwrap()), want);
+}
+
+#[tokio::test]
 async fn empty_file_downloads_cleanly() {
     let server = TestServer::start(
         Vec::new(),

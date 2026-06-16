@@ -58,6 +58,13 @@ pub struct DownloaderConfig {
     /// one. A caller-supplied checksum is always verified regardless. Costs one
     /// sequential read+hash of the file, only when a digest is available.
     pub verify_server_digest: bool,
+    /// Make resume crash-safe against *power loss* (not just process kill):
+    /// `fdatasync`/`fsync` the data file before each resume checkpoint, so the
+    /// saved progress never names bytes the OS hasn't durably written. Off by
+    /// default because the extra syncs cost throughput — the default already
+    /// survives a process kill (the page cache outlives the process); only a
+    /// hard power loss / kernel panic needs this.
+    pub durable_resume: bool,
     /// Per-worker: maximum number of retry attempts before giving up.
     pub max_retries: u32,
     /// Initial backoff between retries; doubles each time up to
@@ -78,6 +85,7 @@ impl Default for DownloaderConfig {
             state_save_interval: Duration::from_secs(2),
             flush_interval_bytes: 4 * 1024 * 1024, // 4 MiB
             verify_server_digest: true,
+            durable_resume: false,
             max_retries: 8,
             initial_retry_delay: Duration::from_millis(500),
             max_retry_delay: Duration::from_secs(30),
@@ -384,6 +392,8 @@ impl Downloader {
             let etag = info.etag.clone();
             let last_modified = info.last_modified.clone();
             let state_path_cl = state_path.clone();
+            let data_path = path.to_path_buf();
+            let durable = cfg.durable_resume;
             let stop = stop_bg.clone();
             let interval = cfg.state_save_interval;
             tokio::spawn(state_save_task(
@@ -395,6 +405,8 @@ impl Downloader {
                 last_modified,
                 file_size,
                 state_path_cl,
+                data_path,
+                durable,
                 interval,
                 stop,
             ))
@@ -513,6 +525,7 @@ impl Downloader {
                 info.size,
                 info.supports_range,
                 info.if_range_validator(),
+                cfg.durable_resume,
                 id,
                 &self.inner.reporter,
                 cfg,
@@ -611,12 +624,28 @@ async fn state_save_task(
     last_modified: Option<String>,
     file_size: u64,
     path: PathBuf,
+    data_path: PathBuf,
+    durable_resume: bool,
     interval: Duration,
     stop: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await; // throw away the immediate first tick
+
+    // When durability is requested, keep a handle to the data file so we can
+    // `fdatasync` it before each checkpoint. The file is pre-allocated to its
+    // full length up front, so only data blocks (not size metadata) need
+    // syncing here — `sync_data` is enough and cheaper than `sync_all`.
+    let sync_file = if durable_resume {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     let snapshot = |starts: &[u64], ends: &[u64], currents: &[Arc<AtomicU64>]| {
         DownloadState::new(
@@ -636,20 +665,34 @@ async fn state_save_task(
         .with_resource_id(etag.clone(), last_modified.clone())
     };
 
+    // Snapshot first, then sync, then persist: every byte named by the snapshot
+    // had its `write_all` complete before we read `current`, so it is in the
+    // page cache before the `sync_data` call and therefore durable once it
+    // returns. The saved state can never get ahead of durable bytes.
+    let checkpoint = |starts: &[u64], ends: &[u64], currents: &[Arc<AtomicU64>]| {
+        let s = snapshot(starts, ends, currents);
+        let sync_file = &sync_file;
+        let path = &path;
+        async move {
+            if let Some(f) = sync_file.as_ref() {
+                let _ = f.sync_data().await;
+            }
+            let _ = state::save(path, &s).await;
+        }
+    };
+
     loop {
         tokio::select! {
             biased;
             _ = stop.cancelled() => break,
             _ = ticker.tick() => {
-                let s = snapshot(&starts, &ends, &currents);
-                let _ = state::save(&path, &s).await;
+                checkpoint(&starts, &ends, &currents).await;
             }
         }
     }
-    // Always save once on shutdown so a cancellation or error preserves
+    // Always checkpoint once on shutdown so a cancellation or error preserves
     // resume state.
-    let s = snapshot(&starts, &ends, &currents);
-    let _ = state::save(&path, &s).await;
+    checkpoint(&starts, &ends, &currents).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +866,7 @@ async fn single_thread_attempt(
     expected_size: Option<u64>,
     server_supports_range: bool,
     if_range: Option<&str>,
+    durable_resume: bool,
     id: u64,
     reporter: &Arc<dyn ProgressReporter>,
     cfg: &DownloaderConfig,
@@ -960,6 +1004,11 @@ async fn single_thread_attempt(
             bytes_since_flush += write_len as u64;
             if bytes_since_flush >= cfg.flush_interval_bytes {
                 file.flush().await?;
+                if durable_resume {
+                    // This file grows as we write, so a length-based resume needs
+                    // the size metadata durable too — full fsync, not fdatasync.
+                    file.sync_all().await?;
+                }
                 bytes_since_flush = 0;
             }
         }

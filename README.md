@@ -23,6 +23,13 @@ speed reporting.
   check that also catches a power-loss resume gap or on-disk bit-rot. Runs only
   when a digest is available, so it costs nothing otherwise (toggle the
   server-digest path with `DownloaderConfig::verify_server_digest`).
+- **Power-loss-durable resume** (opt-in, `DownloaderConfig::durable_resume`):
+  the data file is `fsync`ed before each resume checkpoint, so saved progress
+  never names bytes the OS hasn't durably written — closing the one window a
+  validator/checksum can't (a checksum-less download interrupted by power loss).
+  Off by default: the default already survives a process kill (the page cache
+  outlives the process); only a hard power loss needs the extra `fsync`s, which
+  cost throughput.
 - **Single-thread fallback** when the server does not support Range, with
   Range-based resume for that path too.
 - **No shared file mutex**: each worker holds its own file descriptor and
