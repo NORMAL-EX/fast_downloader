@@ -9,6 +9,11 @@ speed reporting.
 - **16 worker threads by default** per task, configurable per-task and globally.
 - **Resumable**: state is persisted to `<file>.dlstate` and atomically rewritten
   on a ticker; interrupted downloads continue where they left off.
+- **Validated resume**: the resume state records the resource's `ETag` /
+  `Last-Modified`. If the server reports a different validator on the next run,
+  the stale state is discarded and the file re-fetched, so a same-size change on
+  the server can never splice two versions together. A matching (or absent)
+  validator resumes as before.
 - **Single-thread fallback** when the server does not support Range, with
   Range-based resume for that path too.
 - **No shared file mutex**: each worker holds its own file descriptor and

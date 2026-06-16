@@ -70,7 +70,11 @@ pub struct FileInfo {
     /// chunked transfer encoding, or omitted Content-Length).
     pub size: Option<u64>,
     pub supports_range: bool,
+    /// Strong/weak validator for the resource. Used to refuse resuming into a
+    /// resource that changed under us (which would corrupt the file).
     pub etag: Option<String>,
+    /// Secondary validator, checked when no `ETag` is available on both sides.
+    pub last_modified: Option<String>,
 }
 
 /// Probe a URL using HEAD and, when necessary, a tiny Range GET, to discover
@@ -104,6 +108,7 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
     let mut size: Option<u64> = None;
     let mut supports_range: Option<bool> = None;
     let mut etag: Option<String> = None;
+    let mut last_modified: Option<String> = None;
 
     if let Ok(resp) = head {
         if resp.status().is_success() {
@@ -118,6 +123,11 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
             etag = resp
                 .headers()
                 .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            last_modified = resp
+                .headers()
+                .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             let ar = resp
@@ -138,6 +148,7 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
                     size,
                     supports_range: true,
                     etag,
+                    last_modified,
                 });
             }
         }
@@ -163,6 +174,13 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
         etag = resp
             .headers()
             .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+    }
+    if last_modified.is_none() {
+        last_modified = resp
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
     }
@@ -199,6 +217,7 @@ pub async fn probe(client: &Client, url: &Url, cfg: &HttpConfig) -> Result<FileI
         size,
         supports_range: confirmed_range || supports_range == Some(true),
         etag,
+        last_modified,
     })
 }
 
