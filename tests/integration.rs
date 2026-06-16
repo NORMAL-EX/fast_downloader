@@ -506,6 +506,64 @@ async fn many_concurrent_queue_downloads_under_multi_thread() {
     queue.shutdown().await;
 }
 
+/// Throughput benchmark. The server runs on its **own** runtime in a dedicated
+/// OS thread so it never steals the client's runtime threads — the timing then
+/// reflects the client's download path, not in-process server contention. Run:
+///   cargo test --release --test integration -- --ignored --nocapture bench
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+async fn bench_multi_thread_throughput() {
+    let size = 128 * 1024 * 1024; // 128 MiB
+    let content = make_content(size, 7);
+
+    // Spin the test server up on an isolated 2-thread runtime in its own OS
+    // thread. We only need its address back; the thread parks forever.
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let server = TestServer::start(
+                content,
+                ServerBehavior {
+                    support_range: true,
+                    chunk_size: 16 * 1024, // many small chunks: stress the path
+                    ..Default::default()
+                },
+            )
+            .await;
+            addr_tx.send(server.addr).unwrap();
+            std::future::pending::<()>().await; // keep server alive
+        });
+    });
+    let addr = addr_rx.recv().unwrap();
+
+    let dl = Downloader::with_config(DownloaderConfig::default(), Arc::new(NoopReporter)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let runs = 5;
+    let mut best = f64::MAX;
+    for i in 0..runs {
+        let dest = tmp.path().join(format!("bench{i}.bin"));
+        let url = format!("http://{addr}/bench{i}.bin");
+        let task = DownloadTask::new(url, dest).with_threads(16);
+        let t = std::time::Instant::now();
+        let out = dl.download(task, CancellationToken::new()).await.unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        let mibps = (out.size as f64 / (1024.0 * 1024.0)) / secs;
+        best = best.min(secs);
+        eprintln!("run {i}: {secs:.3}s  {mibps:.1} MiB/s");
+    }
+    eprintln!(
+        "best: {best:.3}s  ({:.1} MiB/s) over {} MiB",
+        (size as f64 / (1024.0 * 1024.0)) / best,
+        size / (1024 * 1024)
+    );
+}
+
 #[tokio::test]
 async fn drops_during_stream_eventually_recover() {
     let content = make_content(256 * 1024, 51);
